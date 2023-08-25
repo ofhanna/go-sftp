@@ -377,6 +377,8 @@ func (c *client) UploadFile(path string, contents io.ReadCloser) error {
 // appear on the server.
 func (c *client) ListFiles(dir string) ([]string, error) {
 	pattern := filepath.Clean(strings.TrimPrefix(dir, string(os.PathSeparator)))
+	wd := "."
+	var err error
 	switch {
 	case dir == "/":
 		pattern = "*"
@@ -387,11 +389,15 @@ func (c *client) ListFiles(dir string) ([]string, error) {
 			pattern = filepath.Join(dir, "*")
 		}
 	case pattern != "":
-		pattern += "/*"
+		pattern = "[/?]" + pattern + "/*"
+		wd, err = c.client.Getwd()
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	var filenames []string
-	err := c.Walk(".", func(path string, d fs.DirEntry, err error) error {
+	err = c.Walk(wd, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -403,7 +409,8 @@ func (c *client) ListFiles(dir string) ([]string, error) {
 		matches, err := filepath.Match(strings.ToLower(pattern), strings.ToLower(path))
 		if matches && err == nil {
 			// Return the path with exactly the case on the server.
-			idx := strings.Index(strings.ToLower(path), strings.ToLower(strings.TrimSuffix(pattern, "*")))
+			trimmedPattern := strings.TrimPrefix(strings.TrimSuffix(pattern, "*"), "[/?]")
+			idx := strings.Index(strings.ToLower(path), strings.ToLower(trimmedPattern))
 			if idx > -1 {
 				path = path[idx:]
 				if strings.HasPrefix(dir, "/") && !strings.HasPrefix(path, "/") {
@@ -421,6 +428,67 @@ func (c *client) ListFiles(dir string) ([]string, error) {
 		return nil, fmt.Errorf("listing %s failed: %w", dir, err)
 	}
 	return filenames, nil
+}
+
+// Reader will open the file at path and provide a reader to access its contents.
+// Callers need to close the returned Contents
+//
+// Callers should be aware that network errors while reading can occur since contents
+// are streamed from the SFTP server.
+func (c *client) Reader(path string) (*File, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	conn, err := c.connection()
+	if err != nil {
+		return nil, err
+	}
+
+	fd, err := conn.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("sftp: open %s: %w", path, err)
+	}
+
+	var fileinfo fs.FileInfo
+	modTime := time.Now().In(time.UTC)
+	if stat, _ := fd.Stat(); stat != nil {
+		fileinfo = stat
+		modTime = stat.ModTime()
+	}
+
+	return &File{
+		Filename: fd.Name(),
+		Contents: fd,
+		ModTime:  modTime,
+		fileinfo: fileinfo,
+	}, nil
+}
+
+// Open will return the contents at path and consume the entire file contents.
+// WARNING: This method can use a lot of memory by consuming the entire file into memory.
+func (c *client) Open(path string) (*File, error) {
+	r, err := c.Reader(path)
+	if err != nil {
+		return nil, err
+	}
+
+	// read the entire remote file
+	var buf bytes.Buffer
+	if n, err := io.Copy(&buf, r.Contents); err != nil {
+		r.Close()
+		if err != nil && !strings.Contains(err.Error(), sftp.ErrInternalInconsistency.Error()) {
+			return nil, fmt.Errorf("sftp: read (n=%d) %s: %w", n, r.Filename, err)
+		}
+		return nil, fmt.Errorf("sftp: read (n=%d) on %s: %w", n, r.Filename, err)
+	} else {
+		r.Close()
+	}
+
+	return &File{
+		Filename: r.Filename,
+		Contents: io.NopCloser(&buf),
+		ModTime:  r.ModTime,
+	}, nil
 }
 
 // Reader will open the file at path and provide a reader to access its contents.
